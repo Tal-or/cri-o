@@ -1,6 +1,6 @@
 ---
 - name: move cri-o 
-  copy: 
+  synchronize: 
     src: /root/cri-o
     dest: "{{ ansible_env.GOPATH }}/src/github.com/cri-o"
     
@@ -69,7 +69,7 @@
   when: "build_kata | default(False) | bool"
 
 - name: install configs
-  copy:
+  synchronize:
     src: "{{ ansible_env.GOPATH }}/src/github.com/cri-o/cri-o/{{ item.src }}"
     dest: "{{ item.dest }}"
     remote_src: yes
