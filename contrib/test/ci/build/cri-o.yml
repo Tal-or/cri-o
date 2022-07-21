@@ -1,7 +1,7 @@
 ---
 - name: move cri-o 
   unarchive: 
-    src: /root/crio-test.tar.gz
+    src: /root/cri-o.tar.gz
     dest: "{{ ansible_env.GOPATH }}/src/github.com/cri-o"
     
 - name: stat the expected cri-o directory
