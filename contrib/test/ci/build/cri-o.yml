@@ -74,7 +74,7 @@
   when: "build_kata | default(False) | bool"
 
 - name: install configs
-  synchronize:
+  copy:
     src: "{{ ansible_env.GOPATH }}/src/github.com/cri-o/cri-o/{{ item.src }}"
     dest: "{{ item.dest }}"
     remote_src: yes
