@@ -78,13 +78,13 @@
     state: present
 
 - name: install kubectl (for kubetest)
-  synchronize:
+  copy:
     src: "{{ ansible_env.GOPATH }}/src/k8s.io/kubernetes/_output/bin/kubectl"
     dest: "{{ ansible_env.GOPATH }}/bin/kubectl"
     mode: "preserve"
 
 - name: copy kubectl (for e2e tests)
-  synchronize:
+  copy:
     src: "{{ ansible_env.GOPATH }}/src/k8s.io/kubernetes/_output/bin/kubectl"
     dest: "/usr/bin/kubectl"
     mode: "preserve"
