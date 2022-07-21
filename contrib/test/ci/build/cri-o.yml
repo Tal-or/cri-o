@@ -1,7 +1,7 @@
 ---
 - name: create crio dir
   file: 
-    path: "{{ ansible_env.GOPATH }}/src/github.com/cri-o" 
+    path: "{{ ansible_env.GOPATH }}/src/github.com/cri-o/cri-o" 
     state: directory 
 
 - name: extract cri-o 
