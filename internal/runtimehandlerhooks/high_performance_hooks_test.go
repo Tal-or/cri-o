@@ -2,6 +2,8 @@ package runtimehandlerhooks
 
 import (
 	"context"
+	"github.com/opencontainers/runtime-tools/generate"
+	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 	"os"
 	"path/filepath"
 	"strings"
@@ -571,8 +573,8 @@ var _ = Describe("high_performance_hooks", func() {
 		parentFolder := filepath.Join(cpuMountPoint, parent)
 		childFolder := filepath.Join(cpuMountPoint, parent, child)
 
-		verifySetCPUQuota := func(enabled bool, expected string) {
-			err := setCPUQuota(cpuMountPoint, parent, container, enabled)
+		verifySetCPUQuota := func(value string, expected string) {
+			err := setCPUQuota(cpuMountPoint, parent, container, value)
 			Expect(err).To(BeNil())
 
 			content, err := os.ReadFile(filepath.Join(childFolder, "cpu.cfs_quota_us"))
@@ -609,15 +611,56 @@ var _ = Describe("high_performance_hooks", func() {
 			}
 		})
 
-		Context("with enabled equals to true", func() {
-			It("should set cpu.cfs_quota_us to 0", func() {
-				verifySetCPUQuota(true, "0")
+		Context("with a given value", func() {
+			It("should set cpu.cfs_quota_us to specified value", func() {
+				verifySetCPUQuota("0", "0")
 			})
 		})
+	})
+	Describe("SetMutualCPUs", func() {
+		var specgen generate.Generator
+		specgen.SetLinuxResourcesCPUCpus(container.Spec().Linux.Resources.CPU.Cpus)
+		specgen.SetLinuxResourcesCPUQuota(*container.Spec().Linux.Resources.CPU.Quota)
 
-		Context("with enabled equals to false", func() {
-			It("should set cpu.cfs_quota_us to -1", func() {
-				verifySetCPUQuota(false, "-1")
+		quota := int64(200000)
+		period := uint64(100000)
+
+		verifySetMutualCPUs := func(c *oci.Container, reservedCPUs *cpuset.CPUSet) {
+			Expect(setMutualCPUs(&specgen, reservedCPUs)).ToNot(HaveOccurred())
+			lcpures := specgen.Config.Linux.Resources.CPU
+
+			wantCPUSet := cpuset.MustParse("0-1,6-7")
+			gotCPUSet := cpuset.MustParse(lcpures.Cpus)
+			Expect(wantCPUSet.Equals(gotCPUSet)).To(BeTrue(),
+				"cpusets are not equal. want:%q got:%q", wantCPUSet.String(), gotCPUSet.String())
+			_, err := calculateCFSQuota(&specgen)
+			Expect(err).ToNot(HaveOccurred())
+
+			wantQuota := int64(uint64(wantCPUSet.Size()) * period)
+			gotQuota := lcpures.Quota
+			Expect(wantQuota).To(Equal(*gotQuota),
+				"quotas are not equal. want:%d got:%d", wantQuota, *gotQuota)
+		}
+		BeforeEach(func() {
+			// set container CPUs
+			container.SetSpec(
+				&specs.Spec{
+					Linux: &specs.Linux{
+						Resources: &specs.LinuxResources{
+							CPU: &specs.LinuxCPU{
+								Cpus:   "0,1",
+								Quota:  &quota,
+								Period: &period,
+							},
+						},
+					},
+				},
+			)
+		})
+		Context("with more than four reserved CPUs", func() {
+			set := cpuset.MustParse("2-7")
+			It("should change quota and add mutual cpus", func() {
+				verifySetMutualCPUs(container, &set)
 			})
 		})
 	})

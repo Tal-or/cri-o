@@ -9,9 +9,11 @@ import (
 	"github.com/cri-o/cri-o/internal/oci"
 	crioann "github.com/cri-o/cri-o/pkg/annotations"
 	libconfig "github.com/cri-o/cri-o/pkg/config"
+	"github.com/opencontainers/runtime-tools/generate"
 )
 
 type RuntimeHandlerHooks interface {
+	PreCreate(ctx context.Context, c *oci.Container, s *sandbox.Sandbox, spec *generate.Generator) error
 	PreStart(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error
 	PreStop(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error
 }
@@ -38,7 +40,8 @@ func highPerformanceAnnotationsSpecified(annotations map[string]string) bool {
 			strings.HasPrefix(k, crioann.CPUQuotaAnnotation) ||
 			strings.HasPrefix(k, crioann.IRQLoadBalancingAnnotation) ||
 			strings.HasPrefix(k, crioann.CPUCStatesAnnotation) ||
-			strings.HasPrefix(k, crioann.CPUFreqGovernorAnnotation) {
+			strings.HasPrefix(k, crioann.CPUFreqGovernorAnnotation) ||
+			strings.HasPrefix(k, crioann.CPUMutualAnnotation) {
 			return true
 		}
 	}

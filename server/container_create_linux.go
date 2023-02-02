@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"github.com/cri-o/cri-o/internal/runtimehandlerhooks"
 	"os"
 	"path/filepath"
 	"sort"
@@ -825,6 +826,16 @@ func (s *Server) createSandboxContainer(ctx context.Context, ctr ctrfactory.Cont
 			s.nri.undoCreateContainer(ctx, specgen, sb, ociContainer)
 		}
 	}()
+
+	hooks, err := runtimehandlerhooks.GetRuntimeHandlerHooks(ctx, &s.config, sb.RuntimeHandler(), sb.Annotations())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get runtime handler %q hooks", sb.RuntimeHandler())
+	}
+	if hooks != nil {
+		if err := hooks.PreCreate(ctx, ociContainer, sb, specgen); err != nil {
+			return nil, fmt.Errorf("failed to run pre-create hook for container %q: %w", ociContainer.ID(), err)
+		}
+	}
 
 	saveOptions := generate.ExportOptions{}
 	if err := specgen.SaveToFile(filepath.Join(containerInfo.Dir, "config.json"), saveOptions); err != nil {

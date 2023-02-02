@@ -50,6 +50,9 @@ const (
 
 	// SeccompNotifierActionStop indicates that a container should be stopped if used via the SeccompNotifierActionAnnotation key.
 	SeccompNotifierActionStop = "stop"
+
+	// CPUMutualAnnotation sets mutual cpus for guaranteed containers.
+	CPUMutualAnnotation = "cpu-mutual.crio.io"
 )
 
 var AllAllowedAnnotations = []string{
@@ -67,4 +70,5 @@ var AllAllowedAnnotations = []string{
 	CPUCStatesAnnotation,
 	CPUFreqGovernorAnnotation,
 	SeccompNotifierActionAnnotation,
+	CPUMutualAnnotation,
 }

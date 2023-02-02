@@ -2,8 +2,10 @@ package runtimehandlerhooks
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/containers/podman/v4/pkg/env"
 	"os"
 	"os/exec"
 	"path"
@@ -20,9 +22,12 @@ import (
 	"github.com/cri-o/cri-o/utils/cmdrunner"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
+	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/kubernetes/pkg/kubelet/apis/config"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 )
 
@@ -50,6 +55,58 @@ const (
 // HighPerformanceHooks used to run additional hooks that will configure a system for the latency sensitive workloads
 type HighPerformanceHooks struct {
 	irqBalanceConfigFile string
+}
+
+func (h *HighPerformanceHooks) PreCreate(ctx context.Context, c *oci.Container, s *sandbox.Sandbox, specgen *generate.Generator) error {
+	log.Infof(ctx, "Run %q runtime handler pre-create hook for the container %q", HighPerformance, c.ID())
+
+	if isCgroupParentBurstable(s) {
+		log.Infof(ctx, "Container %q is a burstable pod. Skip PreCreate.", c.ID())
+		return nil
+	}
+	if isCgroupParentBestEffort(s) {
+		log.Infof(ctx, "Container %q is a besteffort pod. Skip PreCreate.", c.ID())
+		return nil
+	}
+
+	if *(specgen.Config.Linux.Resources.CPU.Shares)%1024 != 0 {
+		log.Infof(ctx, "Container %q requests partial cpu(s). Skip PreCreate", c.ID())
+		return nil
+	}
+
+	// enable mutual CPUs for the container
+	if ShouldEnableMutualCPUs(s.Annotations()) {
+		reservedCPUs, err := getReservedCpus()
+		if err != nil {
+			return err
+		}
+		if err = setMutualCPUs(specgen, &reservedCPUs); err != nil {
+			return fmt.Errorf("set mutual CPUs failed for container: %s %w", c.ID(), err)
+		}
+		//Adding mutual cpus without increasing cpuQuota,
+		//might result with throttling the processes' threads
+		//if the threads that are running under the mutual cpus
+		//oversteps their boundaries, or the threads that are running
+		//under the reserved cpus consumes the cpuQuota (pretty common in dpdk/latency sensitive applications).
+		//Since we can't determine the cpuQuota for the mutual cpus
+		//and avoid throttling the process is critical, increasing the cpuQuota to the maximum is the best option.
+		quota, err := calculateCFSQuota(specgen)
+		if err != nil {
+			return fmt.Errorf("calculate CFS quota: %w", err)
+		}
+
+		cpuMountPoint, err := cgroups.FindCgroupMountpoint(cgroupMountPoint, "cpu")
+		if err != nil {
+			return err
+		}
+		// the hook is running before the container's cgroups gets created
+		// hence, set the quota of the parent only
+		if err := setParentCPUQuota(cpuMountPoint, s.CgroupParent(), strconv.Itoa(int(quota))); err != nil {
+			return fmt.Errorf("set parent CPU CFS quota: %w", err)
+		}
+		log.Infof(ctx, "setMutualCPUs: container %q; updated cpuset=%q; updated quota=%d", c.ID(), specgen.Config.Linux.Resources.CPU.Cpus, *specgen.Config.Linux.Resources.CPU.Quota)
+	}
+	return nil
 }
 
 func (h *HighPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error {
@@ -90,7 +147,7 @@ func (h *HighPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s
 		if err != nil {
 			return err
 		}
-		if err := setCPUQuota(cpuMountPoint, s.CgroupParent(), c, false); err != nil {
+		if err := setCPUQuota(cpuMountPoint, s.CgroupParent(), c, "-1"); err != nil {
 			return fmt.Errorf("set CPU CFS quota: %w", err)
 		}
 	}
@@ -122,8 +179,22 @@ func (h *HighPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s
 			return fmt.Errorf("set CPU scaling governor: %w", err)
 		}
 	}
-
 	return nil
+}
+
+func calculateCFSQuota(specgen *generate.Generator) (quota int64, err error) {
+	lspec := specgen.Config.Linux
+	cpus, err := cpuset.Parse(lspec.Resources.CPU.Cpus)
+	if err != nil {
+		return
+	}
+	quan, err := resource.ParseQuantity(strconv.Itoa(cpus.Size()))
+	if err != nil {
+		return
+	}
+	quota = (quan.MilliValue() * int64(*(lspec.Resources.CPU.Period))) / milliCPUToCPU
+	specgen.SetLinuxResourcesCPUQuota(quota)
+	return
 }
 
 func (h *HighPerformanceHooks) PreStop(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error {
@@ -216,6 +287,10 @@ func shouldCStatesBeConfigured(annotations fields.Set) (present bool, value stri
 func shouldFreqGovernorBeConfigured(annotations fields.Set) (present bool, value string) {
 	value, present = annotations[crioannotations.CPUFreqGovernorAnnotation]
 	return
+}
+
+func ShouldEnableMutualCPUs(annotations fields.Set) bool {
+	return annotations[crioannotations.CPUMutualAnnotation] == annotationEnable
 }
 
 func annotationValueDeprecationWarning(annotation string) string {
@@ -357,11 +432,33 @@ func setIRQLoadBalancing(c *oci.Container, enable bool, irqSmpAffinityFile, irqB
 	return nil
 }
 
-func setCPUQuota(cpuMountPoint, parentDir string, c *oci.Container, enable bool) error {
+func setParentCPUQuota(cpuMountPoint, parentDir string, value string) error {
+	var parentCfsQuotaPath string
+
+	if strings.HasSuffix(parentDir, ".slice") {
+		// systemd fs
+		parentPath, err := systemd.ExpandSlice(parentDir)
+		if err != nil {
+			return err
+		}
+		parentCfsQuotaPath = filepath.Join(cpuMountPoint, parentPath, "cpu.cfs_quota_us")
+	} else {
+		// cgroupfs
+		parentCfsQuotaPath = filepath.Join(cpuMountPoint, parentDir, "cpu.cfs_quota_us")
+	}
+	if _, err := os.Stat(parentCfsQuotaPath); err != nil {
+		return err
+	}
+	if err := os.WriteFile(parentCfsQuotaPath, []byte(value), 0o644); err != nil {
+		return err
+	}
+	return nil
+}
+
+func setCPUQuota(cpuMountPoint, parentDir string, c *oci.Container, value string) error {
 	var rpath string
 	var err error
 	var cfsQuotaPath string
-	var parentCfsQuotaPath string
 	var cgroupManager cgmgr.CgroupManager
 
 	if strings.HasSuffix(parentDir, ".slice") {
@@ -369,11 +466,6 @@ func setCPUQuota(cpuMountPoint, parentDir string, c *oci.Container, enable bool)
 		if cgroupManager, err = cgmgr.SetCgroupManager("systemd"); err != nil {
 			return nil
 		}
-		parentPath, err := systemd.ExpandSlice(parentDir)
-		if err != nil {
-			return err
-		}
-		parentCfsQuotaPath = filepath.Join(cpuMountPoint, parentPath, "cpu.cfs_quota_us")
 		if rpath, err = cgroupManager.ContainerCgroupAbsolutePath(parentDir, c.ID()); err != nil {
 			return err
 		}
@@ -383,7 +475,6 @@ func setCPUQuota(cpuMountPoint, parentDir string, c *oci.Container, enable bool)
 		if cgroupManager, err = cgmgr.SetCgroupManager("cgroupfs"); err != nil {
 			return nil
 		}
-		parentCfsQuotaPath = filepath.Join(cpuMountPoint, parentDir, "cpu.cfs_quota_us")
 		if rpath, err = cgroupManager.ContainerCgroupAbsolutePath(parentDir, c.ID()); err != nil {
 			return err
 		}
@@ -393,25 +484,13 @@ func setCPUQuota(cpuMountPoint, parentDir string, c *oci.Container, enable bool)
 	if _, err := os.Stat(cfsQuotaPath); err != nil {
 		return err
 	}
-	if _, err := os.Stat(parentCfsQuotaPath); err != nil {
+
+	if err := setParentCPUQuota(cpuMountPoint, parentDir, value); err != nil {
 		return err
 	}
 
-	if enable {
-		// there should have no use case to get here, as the pod cgroup will be deleted when the pod end
-		if err := os.WriteFile(cfsQuotaPath, []byte("0"), 0o644); err != nil {
-			return err
-		}
-		if err := os.WriteFile(parentCfsQuotaPath, []byte("0"), 0o644); err != nil {
-			return err
-		}
-	} else {
-		if err := os.WriteFile(cfsQuotaPath, []byte("-1"), 0o644); err != nil {
-			return err
-		}
-		if err := os.WriteFile(parentCfsQuotaPath, []byte("-1"), 0o644); err != nil {
-			return err
-		}
+	if err := os.WriteFile(cfsQuotaPath, []byte(value), 0o644); err != nil {
+		return err
 	}
 
 	return nil
@@ -653,4 +732,60 @@ func RestoreIrqBalanceConfig(irqBalanceConfigFile, irqBannedCPUConfigFile, irqSm
 		}
 	}
 	return nil
+}
+
+func setMutualCPUs(specgen *generate.Generator, reservedCPUs *cpuset.CPUSet) error {
+	lspec := specgen.Config.Linux
+	if lspec.Resources == nil ||
+		lspec.Resources.CPU == nil ||
+		lspec.Resources.CPU.Cpus == "" {
+		return fmt.Errorf("no cpus found")
+	}
+
+	cpus := reservedCPUs.ToSliceNoSort()
+	var mutualCPUsSlice []int
+	// 4 is the number of cpus that are needed
+	// for housekeeping tasks, hence do not
+	// use them as shared cpus
+	for i := 4; i < reservedCPUs.Size(); i++ {
+		mutualCPUsSlice = append(mutualCPUsSlice, cpus[i])
+	}
+	if len(mutualCPUsSlice) == 0 {
+		return fmt.Errorf("no mutual cpus found")
+	}
+
+	mutualCPUs := cpuset.NewCPUSet(mutualCPUsSlice...)
+	curCpus, err := cpuset.Parse(lspec.Resources.CPU.Cpus)
+	if err != nil {
+		return err
+	}
+	specgen.SetLinuxResourcesCPUCpus(curCpus.Union(mutualCPUs).String())
+	// set an environment variable to
+	// reflect the mutual CPUs
+	envs, err := env.ParseSlice(specgen.Config.Process.Env)
+	if err != nil {
+		return err
+	}
+	envs["OPENSHIFT_MUTUAL_CPUS"] = mutualCPUs.String()
+	specgen.Config.Process.Env = env.Slice(envs)
+	return nil
+}
+
+const (
+	kubeletPath   = "/etc/kubernetes/kubelet.conf"
+	milliCPUToCPU = 1000
+)
+
+// TODO check for alternatives for getting the reserved cpus
+func getReservedCpus() (cpuset.CPUSet, error) {
+	b, err := os.ReadFile(kubeletPath)
+	if err != nil {
+		return cpuset.CPUSet{}, fmt.Errorf("failed to read kubelet config at: %s; %w", kubeletPath, err)
+	}
+	kc := &config.KubeletConfiguration{}
+	err = json.Unmarshal(b, kc)
+	if err != nil {
+		return cpuset.CPUSet{}, fmt.Errorf("failed to unmarshal kubelet config; %w", err)
+	}
+	return cpuset.Parse(kc.ReservedSystemCPUs)
 }

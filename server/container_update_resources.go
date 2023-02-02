@@ -6,6 +6,7 @@ import (
 	"github.com/cri-o/cri-o/internal/config/node"
 	"github.com/cri-o/cri-o/internal/log"
 	"github.com/cri-o/cri-o/internal/oci"
+	"github.com/cri-o/cri-o/internal/runtimehandlerhooks"
 	"github.com/gogo/protobuf/proto"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	types "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -32,6 +33,11 @@ func (s *Server) UpdateContainerResources(ctx context.Context, req *types.Update
 			return nil, err
 		}
 		resources := toOCIResources(updated)
+		sb := s.GetSandbox(c.Sandbox())
+		if runtimehandlerhooks.ShouldEnableMutualCPUs(sb.Annotations()) {
+			// bypass the update coming from CPUManager
+			resources.CPU.Cpus = c.Spec().Linux.Resources.CPU.Cpus
+		}
 		if err := s.Runtime().UpdateContainer(ctx, c, resources); err != nil {
 			return nil, err
 		}
