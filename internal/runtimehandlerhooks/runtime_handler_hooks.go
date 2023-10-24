@@ -2,6 +2,7 @@ package runtimehandlerhooks
 
 import (
 	"context"
+	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 	"strings"
 	"sync"
 
@@ -27,13 +28,14 @@ type RuntimeHandlerHooks interface {
 func GetRuntimeHandlerHooks(ctx context.Context, config *libconfig.Config, handler string, annotations map[string]string) (RuntimeHandlerHooks, error) {
 	ctx, span := log.StartSpan(ctx)
 	defer span.End()
+	shared := cpuset.New([]int{0}...)
 	if strings.Contains(handler, HighPerformance) {
 		log.Warnf(ctx, "The usage of the handler %q without adding high-performance feature annotations under allowed_annotations will be deprecated under 1.21", HighPerformance)
-		return &HighPerformanceHooks{config.IrqBalanceConfigFile}, nil
+		return &HighPerformanceHooks{irqBalanceConfigFile: config.IrqBalanceConfigFile, sharedCPUs: &shared}, nil
 	}
 	if highPerformanceAnnotationsSpecified(annotations) {
 		log.Warnf(ctx, "The usage of the handler %q without adding high-performance feature annotations under allowed_annotations will be deprecated under 1.21", HighPerformance)
-		return &HighPerformanceHooks{config.IrqBalanceConfigFile}, nil
+		return &HighPerformanceHooks{irqBalanceConfigFile: config.IrqBalanceConfigFile, sharedCPUs: &shared}, nil
 	}
 	if cpuLoadBalancingAllowed(config) {
 		return &DefaultCPULoadBalanceHooks{}, nil
@@ -48,7 +50,8 @@ func highPerformanceAnnotationsSpecified(annotations map[string]string) bool {
 			strings.HasPrefix(k, crioann.CPUQuotaAnnotation) ||
 			strings.HasPrefix(k, crioann.IRQLoadBalancingAnnotation) ||
 			strings.HasPrefix(k, crioann.CPUCStatesAnnotation) ||
-			strings.HasPrefix(k, crioann.CPUFreqGovernorAnnotation) {
+			strings.HasPrefix(k, crioann.CPUFreqGovernorAnnotation) ||
+			strings.HasPrefix(k, crioann.CPUSharedAnnotation) {
 			return true
 		}
 	}

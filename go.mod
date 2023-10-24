@@ -56,6 +56,7 @@ require (
 	github.com/opencontainers/runtime-spec v1.1.0-rc.2
 	github.com/opencontainers/runtime-tools v0.9.1-0.20230317050512-e931285f4b69
 	github.com/opencontainers/selinux v1.11.0
+	github.com/openshift-kni/mixed-cpu-node-plugin v0.0.0-20231018121941-c906c314273a
 	github.com/prometheus/client_golang v1.14.0
 	github.com/seccomp/libseccomp-golang v0.10.0
 	github.com/sirupsen/logrus v1.9.0
@@ -75,10 +76,10 @@ require (
 	golang.org/x/sys v0.7.0
 	google.golang.org/grpc v1.54.0
 	google.golang.org/protobuf v1.30.0
-	k8s.io/api v0.27.0
-	k8s.io/apimachinery v0.27.0
+	k8s.io/api v0.27.1
+	k8s.io/apimachinery v0.27.1
 	k8s.io/apiserver v0.27.0
-	k8s.io/client-go v0.27.0
+	k8s.io/client-go v1.5.2
 	k8s.io/cri-api v0.27.0
 	k8s.io/klog/v2 v2.90.1
 	k8s.io/kubernetes v1.27.0

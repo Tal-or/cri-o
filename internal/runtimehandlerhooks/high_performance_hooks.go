@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 	"os"
 	"os/exec"
 	"path"
@@ -24,7 +26,6 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/fields"
-	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 )
 
 const (
@@ -44,11 +45,22 @@ const (
 	irqBalancedName      = "irqbalance"
 	sysCPUDir            = "/sys/devices/system/cpu"
 	sysCPUSaveDir        = "/var/run/crio/cpu"
+	milliCPUToCPU        = 1000
+)
+
+const (
+	cpusetPartition      = "cpuset.cpus.partition"
+	cpusetExclusive      = "cpuset.cpus.exclusive"
+	cpusetCpus           = "cpuset.cpus"
+	cgroupSubTreeControl = "cgroup.subtree_control"
+	cgroupV1Quota        = "cpu.cfs_quota_us"
+	cgroupV2Quota        = "cpu.max"
 )
 
 // HighPerformanceHooks used to run additional hooks that will configure a system for the latency sensitive workloads
 type HighPerformanceHooks struct {
 	irqBalanceConfigFile string
+	sharedCPUs           *cpuset.CPUSet
 }
 
 func (h *HighPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s *sandbox.Sandbox) error {
@@ -63,6 +75,12 @@ func (h *HighPerformanceHooks) PreStart(ctx context.Context, c *oci.Container, s
 	if shouldCPULoadBalancingBeDisabled(s.Annotations()) {
 		if err := setCPULoadBalancing(c, false); err != nil {
 			return fmt.Errorf("set CPU load balancing: %w", err)
+		}
+	}
+
+	if requestedSharedCPUs(s.Annotations(), c.CRIContainer().GetMetadata().GetName()) {
+		if err := setSharedCPUs(ctx, c, s, h.sharedCPUs); err != nil {
+			return fmt.Errorf("set shared CPUs: %w", err)
 		}
 	}
 
@@ -208,6 +226,12 @@ func shouldFreqGovernorBeConfigured(annotations fields.Set) (present bool, value
 
 func annotationValueDeprecationWarning(annotation string) string {
 	return fmt.Sprintf("The usage of the annotation %q with value %q will be deprecated under 1.21", annotation, "true")
+}
+
+func requestedSharedCPUs(annotations fields.Set, cName string) bool {
+	key := crioannotations.CPUSharedAnnotation + "/" + cName
+	v, ok := annotations[key]
+	return ok && v == annotationEnable
 }
 
 // setCPULoadBalancing relies on the cpuset cgroup to disable load balancing for containers.
@@ -763,4 +787,101 @@ func isCgroupParentBestEffort(s *sandbox.Sandbox) bool {
 
 func isContainerRequestWholeCPU(cSpec *specs.Spec) bool {
 	return *(cSpec.Linux.Resources.CPU.Shares)%1024 == 0
+}
+
+func setSharedCPUs(ctx context.Context, c *oci.Container, s *sandbox.Sandbox, sharedCPUs *cpuset.CPUSet) error {
+	lspec := c.Spec().Linux
+	if lspec == nil ||
+		lspec.Resources == nil ||
+		lspec.Resources.CPU == nil ||
+		lspec.Resources.CPU.Cpus == "" {
+		return fmt.Errorf("no cpus found for container %q", c.Name())
+	}
+	ctrCpuSet, err := cpuset.Parse(lspec.Resources.CPU.Cpus)
+	log.Infof(ctx, "container %q cpus ids before applying shared cpus %q", c.Name(), ctrCpuSet.String())
+	if err != nil {
+		return err
+	}
+	ctrCpuSet = ctrCpuSet.Union(*sharedCPUs)
+	quota, err := calculateCFSQuota(&ctrCpuSet, int64(*(lspec.Resources.CPU.Period)))
+	if err != nil {
+		return err
+	}
+	pid, err := c.Pid()
+	if err != nil {
+		return fmt.Errorf("failed to get pid of container %s: %w", c.ID(), err)
+	}
+	ch, err := node.CgroupBuildHierarchyFrom(pid)
+	if err != nil {
+		return fmt.Errorf("failed to build cgroup hierarchy of container %s: %w", c.ID(), err)
+	}
+
+	podCpusetCgroup := ch.GetAbsoluteControllerPodPath("cpuset")
+	podCpuAcctCgroup := ch.GetAbsoluteControllerPodPath("cpuacct")
+	// pod level operations
+	_, err = addOrRemoveCpusetFromFile(podCpusetCgroup, cpusetCpus, *sharedCPUs, true)
+	if err != nil {
+		return err
+	}
+	if err = cgroups.WriteFile(podCpuAcctCgroup, quotaFile(), strconv.FormatInt(quota, 10)); err != nil {
+		return err
+	}
+
+	ctrCpusetCgroup := ch.GetAbsoluteControllerContainerPath("cpuset")
+	ctrCpuAcctCgroup := ch.GetAbsoluteControllerContainerPath("cpuacct")
+
+	_, err = addOrRemoveCpusetFromFile(ctrCpusetCgroup, cpusetCpus, *sharedCPUs, true)
+	if err != nil {
+		return err
+	}
+	log.Infof(ctx, "container %q cpus ids after applying shared cpus %q", c.Name(), ctrCpuSet.String())
+
+	if err = cgroups.WriteFile(ctrCpuAcctCgroup, quotaFile(), strconv.FormatInt(quota, 10)); err != nil {
+		return err
+	}
+	// we need to move the isolated cpus into a separate child cgroup
+	if shouldCPULoadBalancingBeDisabled(s.Annotations()) && node.CgroupIsV2() {
+		// on V2 all controllers are under the same path
+		ctrCgroup := ctrCpusetCgroup
+		if err = cgroups.WriteFile(ctrCgroup, cgroupSubTreeControl, "+cpu +cpuset"); err != nil {
+			return err
+		}
+		if err = cgroups.WriteFile(ctrCgroup, cpusetPartition, "member"); err != nil {
+			return err
+		}
+		cgroupChildDir := filepath.Join(ctrCgroup, "cgroup-child")
+		if err = os.Mkdir(cgroupChildDir, 755); err != nil {
+			return err
+		}
+		cpus, err := cgroups.ReadFile(ctrCgroup, cpusetExclusive)
+		if err != nil {
+			return err
+		}
+		if err = cgroups.WriteFile(cgroupChildDir, cpusetCpus, cpus); err != nil {
+			return err
+		}
+		if err = cgroups.WriteFile(cgroupChildDir, cpusetExclusive, cpus); err != nil {
+			return err
+		}
+		if err = cgroups.WriteFile(cgroupChildDir, cpusetPartition, "isolated"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func calculateCFSQuota(cpus *cpuset.CPUSet, period int64) (quota int64, err error) {
+	quan, err := resource.ParseQuantity(strconv.Itoa(cpus.Size()))
+	if err != nil {
+		return
+	}
+	quota = (quan.MilliValue() * period) / milliCPUToCPU
+	return
+}
+
+func quotaFile() string {
+	if node.CgroupIsV2() {
+		return cgroupV2Quota
+	}
+	return cgroupV1Quota
 }
