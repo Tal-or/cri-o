@@ -57,6 +57,11 @@ const (
 	cgroupV2Quota        = "cpu.max"
 )
 
+const (
+	IsolatedCPUsEnvVar = "OPENSHIFT_ISOLATED_CPUS"
+	SharedCPUsEnvVar   = "OPENSHIFT_SHARED_CPUS"
+)
+
 // HighPerformanceHooks used to run additional hooks that will configure a system for the latency sensitive workloads
 type HighPerformanceHooks struct {
 	irqBalanceConfigFile string
@@ -797,12 +802,12 @@ func setSharedCPUs(ctx context.Context, c *oci.Container, s *sandbox.Sandbox, sh
 		lspec.Resources.CPU.Cpus == "" {
 		return fmt.Errorf("no cpus found for container %q", c.Name())
 	}
-	ctrCpuSet, err := cpuset.Parse(lspec.Resources.CPU.Cpus)
-	log.Infof(ctx, "container %q cpus ids before applying shared cpus %q", c.Name(), ctrCpuSet.String())
+	isolatedCPUs, err := cpuset.Parse(lspec.Resources.CPU.Cpus)
+	log.Infof(ctx, "container %q cpus ids before applying shared cpus %q", c.Name(), isolatedCPUs.String())
 	if err != nil {
 		return err
 	}
-	ctrCpuSet = ctrCpuSet.Union(*sharedCPUs)
+	ctrCpuSet := isolatedCPUs.Union(*sharedCPUs)
 	quota, err := calculateCFSQuota(&ctrCpuSet, int64(*(lspec.Resources.CPU.Period)))
 	if err != nil {
 		return err
@@ -853,20 +858,20 @@ func setSharedCPUs(ctx context.Context, c *oci.Container, s *sandbox.Sandbox, sh
 		if err = os.Mkdir(cgroupChildDir, 755); err != nil {
 			return err
 		}
-		cpus, err := cgroups.ReadFile(ctrCgroup, cpusetExclusive)
 		if err != nil {
 			return err
 		}
-		if err = cgroups.WriteFile(cgroupChildDir, cpusetCpus, cpus); err != nil {
+		if err = cgroups.WriteFile(cgroupChildDir, cpusetCpus, isolatedCPUs.String()); err != nil {
 			return err
 		}
-		if err = cgroups.WriteFile(cgroupChildDir, cpusetExclusive, cpus); err != nil {
+		if err = cgroups.WriteFile(cgroupChildDir, cpusetExclusive, isolatedCPUs.String()); err != nil {
 			return err
 		}
 		if err = cgroups.WriteFile(cgroupChildDir, cpusetPartition, "isolated"); err != nil {
 			return err
 		}
 	}
+	injectCpusetEnv(c, &isolatedCPUs, sharedCPUs)
 	return nil
 }
 
@@ -884,4 +889,12 @@ func quotaFile() string {
 		return cgroupV2Quota
 	}
 	return cgroupV1Quota
+}
+
+func injectCpusetEnv(c *oci.Container, isolated, shared *cpuset.CPUSet) {
+	spec := c.Spec()
+	spec.Process.Env = append(spec.Process.Env,
+		fmt.Sprintf("%s=%s", IsolatedCPUsEnvVar, isolated.String()),
+		fmt.Sprintf("%s=%s", SharedCPUsEnvVar, shared.String()))
+	c.SetSpec(&spec)
 }
